@@ -1,0 +1,196 @@
+---
+title: Bixi analysis
+output: html_document
+author: Vu-Hong-Hai Phan
+---
+
+```{r}
+library(data.table)
+library(tidyverse)
+library(knitr)
+```
+
+# Part 1. How many bikes should we add to the current fleet?
+
+The demand for Bixi's service is increasing by the year. So the question is how many are needed to keep the level of satisfaction the same for 2024. To do this, first, we need to load the historical data. In this analysis, we'll use the historical data from 2019 to 2023. The data is already pre-processed and organized.
+
+First, the trips data and station data are loaded to `trips_data` list and `stations_data` list respectively. Each list is named by the year that the data comes from. The `trips_data` contains `start_station_id`, `start_time`, `end_station_id`, and `end_time`. Some datasets will also contain `is_member` and `trip_duration`, however, for this analysis, we are not using them. The `stations_data` contains `id`, `station`(the name), `lat`, and `long`.
+
+```{r, results='hide'}
+FILE_PATH <- 'data/processed'
+trips_data = list()
+trips_files <- list.files(path=FILE_PATH, pattern='^trips', full.names=T)
+for (trips_file in trips_files) {
+  year <- str_extract(trips_file, '\\d+')
+  message(year)
+  trips_data[[year]] <- fread(trips_file)
+  str(trips_data[[year]])
+}
+```
+
+```{r, results='hide'}
+stations_data = list()
+stations_files <- list.files(path=FILE_PATH, pattern='^stations', full.names=T)
+for (stations_file in stations_files) {
+  year <- str_extract(stations_file, '\\d+')
+  message(year)
+  stations_data[[year]] <- fread(stations_file)
+  str(stations_data[[year]])
+}
+```
+
+In this analyst task, we are concentrating on the number of concurrent trips at a time. So first, we should make sure the data is clean. To do so, we need to remove all the rows that:
+
+-   `start_time` or `end_time` field contains null value.
+-   `start_time` is greater than `end_time`.
+-   `start_time` or `end_time` from a different year.
+
+Here is the result:
+
+```{r}
+for (year in names(trips_data)) {
+  message(year)
+  year_start <- floor_date(as.Date(year, format='%Y'), unit='year')
+  year_plus1_start <- floor_date(as.Date(as.character(as.numeric(year)+1), format='%Y'), unit='year')
+  prev_nrows <- nrow(trips_data[[year]])
+  # Remove all rows that start_time is NULL or end_time is NULL or start_time >
+  # end_time or start_time or end_time is outside of the current year
+  trips_data[[year]] <- trips_data[[year]][!((start_time > end_time) |
+                                               (start_time < year_start) |
+                                               (end_time >= year_plus1_start))]
+  curr_nrows <- nrow(trips_data[[year]])
+  message('Dropped :', prev_nrows-curr_nrows)
+}
+```
+
+## 1. Trips' distribution
+
+Next, let's have a quick look at the data. This time, we can use a `histogram` to show the distribution of trips by each start hour. To do so efficiently, we can first group the trips by hour and count them using the highly optimized `group_by` operation from `data.table` and re-construct a `histogram` plot using `bar` plot.
+
+```{r}
+trips_by_hour <- list()
+for (year in names(trips_data)) {
+  # Group the trips by start hour and count using data.table convention
+  trips_by_hour[[year]] <- trips_data[[year]][, .N, by=lubridate::hour(start_time)]
+}
+# Bind all dataframes in the list to a large one
+binded_trips_by_hour <- rbindlist(trips_by_hour, idcol=T)
+```
+
+```{r}
+ggplot(binded_trips_by_hour, aes(x=lubridate, y=N, fill=as.factor(.id))) +
+  geom_bar(stat='identity', position='dodge') +
+  labs(title='Trips distribution',
+       x='Start hour',
+       y='Count',
+       fill='Year') +
+   scale_x_continuous(n.breaks=24)
+```
+
+From the plot, we can see that the number of trips steadily increased over the year, except for `2020`, when the pandemic happened and curfew orders were in place. One interesting observation is there are two spikes in the using patterns. The first spike happens around 8 am and the second, larger spike happens around 5 pm.
+
+## 2. The amount of concurrence trips.
+
+To calculate the number of concurrence trips, we need to scan the whole data set at any given timestamp and count the number of active trips, that have started but haven't ended. This will require a significant amount of resources if we want to do it with the definition of seconds and it's not really necessary. Thus, we will divide the time to every 2-minute interval and determine the number of trips that are active at each interval.
+
+```{r}
+trips_at_atime <- list()
+for (year in names(trips_data)) {
+  curr_data <- trips_data[[year]]
+  min_time <- min(curr_data$start_time)
+  max_time <- max(curr_data$end_time)
+  # Create a sequence to of time step by every 2-minute interval
+  time_seq <- seq(min_time, max_time, by="2 mins")
+  # Build a lookup table with the start and the end of each row is two time 
+  # step of 2 minutes each
+  lookup <- data.table(start=head(time_seq, -1), end=tail(time_seq, -1),
+                       key=c('start', 'end'))
+  # Using foverlaps() function to perform binary search the time data for
+  # overlapping interals
+  overlap_join <- foverlaps(curr_data, lookup, by.x=c('start_time', 'end_time'),
+                   by.y=c('start', 'end'), type='any', which=TRUE)
+  # Perform the group_by process, by the time interval's id, and count the number
+  # of trips
+  trips_at_atime[[year]] <- overlap_join[, .N, by=yid]
+}
+```
+
+Next, let's bind the concurrence trip counter and create a large dataframe. To do so, we'll use `data.table`'s binding method. It'll create a new column named `.id` that contains the year the data comes from.
+
+```{r}
+binded_counter <- rbindlist(trips_at_atime, idcol=T)
+```
+
+Now let's plot the "histogram" of the number of concurence trips.
+
+```{r, fig.height=8, fig.width=6, fig.align='center'}
+library(ggridges)
+theme_set(theme_minimal())
+ggplot(
+  binded_counter, 
+  aes(x=N, y=.id, height=stat(density))) +
+  geom_density_ridges(
+    stat="binline", binwidth=20, scale=0.95,
+    draw_baseline=F, color="darkblue", fill="lightblue"
+  )
+```
+
+We can see that the highest number of trips, in general, increasing by the year. The exceptions are for 2020 and 2021 and it's understandable since there are multiple regulations regarding the garthering in the pandemic. We can see the maximum number of concurrence trips each year clearly in this table.
+
+```{r}
+binded_counter[, max(N), by=.id] %>% rename(year=.id, maximum_occupant=V1)
+```
+
+And now comes the important question: "How many vehicles should we add to the fleet for the next year?". Adding too many and it's a waste of resources. Adding too little and the ratio of people who can get a ride to the number of people who need a ride decreases. In other words, the level of satisfaction will decrease. With the assumption that most of the peak-demand vehicle is used on the popular routes, we can use a simple linear regression model to determine the upper bound of how many we should add to the fleet. Since the year 2020 is heavily affected by the pandemic, we'll exclude it from the data points for the regression model.
+
+```{r}
+data <- binded_counter[, max(N), by=.id] %>%
+          rename(year=.id, maximum_occupant=V1) %>%
+          filter(year!='2020') %>%
+          mutate(year=as.integer(year))
+          
+model1 <- lm(maximum_occupant ~ year, data=data)
+plot(data$year, data$maximum_occupant, xlab='Year', ylab='Maximum occupant') +
+  abline(model1, col='red')
+```
+
+The model definitely doesn't fit the data well enough. Let's check the model's summary.
+
+```{r}
+summary(model1)
+```
+
+The R-squared of 0.51 tells us just half of the variation in the data can be explained by the change in the years. The p-value of 0.28 means that the data we currently have is not significant enough to give a correct forecast. In other words, the result of this prediction is close to an "educated guess"!
+
+With this model, the highest amount of concurrence trips is 2481!
+
+```{r}
+predict(model1, list('year'=2024))
+```
+
+Now let's change the data, instead of removing only data from 2020, we also remove the data from 2019.
+
+```{r}
+data <- binded_counter[, max(N), by=.id] %>%
+          rename(year=.id, maximum_occupant=V1) %>%
+          filter(year!='2020'&year!='2019') %>%
+          mutate(year=as.integer(year))
+          
+model2 <- lm(maximum_occupant ~ year, data=data)
+plot(data$year, data$maximum_occupant, xlab='Year', ylab='Maximum occupant') +
+  abline(model2, col='red')
+summary(model2)
+```
+
+This times, it fits much better, but it can also be caused by less data points. From this model, the predicted result is 3250, which means at least around 700 more or around 27.4%, compared to 2023. Of course, this is with the assumption that all are put in use at the peak demand.
+
+```{r}
+predict(model2, list('year'=2024))
+```
+
+## 3. Conclusion
+
+1.  The demand for BIXI is still steadily increasing, with both the number of rides and the peak maximum number of bikes on roads increasing through the years.
+2.  The pandemic has heavily affected the bike-sharing service and it takes one year to bounce back.
+3.  For the year 2024, the maximum number of busy vehicles at a time will continue to increase. This means more network balance is needed during rush hours. Also, around 700 more vehicles should be added to the busiest routes with the assumption that peak demands happen on these routes.
+4.  Finally, 700 is the upper bound of vehicles should we add to the current fleet.
