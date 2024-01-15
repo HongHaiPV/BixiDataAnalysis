@@ -1,0 +1,650 @@
+---
+title: 'Bixi Part 1: Pre-processing'
+output: html_document
+author: 'Phan Vu-Hong-Hai'
+date: "Last updated on `r format(Sys.time(), '%d %B, %Y')`"
+---
+
+This is the first document in a series of notebooks that I intended to publish about the BIXI open dataset. This is the document of the pre-processing steps for the data from [BIXI open data website](https://bixi.com/en/open-data/). The selected data is from 2019 to 2023 and are organized as follows:
+
+1.  `data/raw/<year>` contains the downloaded data for each year, in the form of `zip` files.
+2.  `data/raw_csv/<year>` contains the unzipped data for each year.
+3.  `data/processed` contains the pre-processed files, the trips data take the form of `trips_<year>.csv` and the stations' data take the form of `stations_<year>.csv`
+
+In this project, we'll use the `data.table`, `tidyverse` and `knitr` library.
+
+**WARNING: For consistency and performance, the timezone of all data is defaulted to UTC and interpreted as if they were local time.**
+
+```{r, , message=FALSE}
+library(data.table)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+
+# Remove the comments in the outputs
+knitr::opts_chunk$set(comment=NA)
+```
+
+At this step, the needed data is assumed to be already downloaded to the `data/zipfiles` folder. The folder structure is shown as follows:
+
+```{r zipfiles-structure}
+ZIP_DATA <- file.path('data', 'zipfiles')
+system(paste('tree', ZIP_DATA))
+```
+
+Next, unzip the zip files in the `data/zipfiles` folder using R's `unzip()` functions. In this project, we will only work with the data from 2019 onward. The zipped data in the `data/zipfiles` is stored with the year value in the file names, thus, we can extract the year of data using `str_extract()` function. The newly extracted csv files will be stored in the `data/raw_csv/<year>` folders.
+
+The extracted file names are stored by year in the `records` list variable for the later references.
+
+```{r data-unzip}
+zip_files <- list.files(path=ZIP_DATA, pattern='*.zip', full.names=T)
+records <- c()
+for (zip_file in zip_files) {
+    cat('Unzipping', zip_file, '\n')
+    # Extract the year from the file path.
+    year <-str_extract(zip_file, regex('\\d{4}'))
+    csv_folder <- file.path('data', 'raw_csv', year)
+    records[year] <- csv_folder
+    # Check if the current file is already extracted.
+    if (dir.exists(csv_folder))
+      next
+    unzip(zip_file, exdir=csv_folder)
+}
+```
+
+Now, we will have a quick look at the list of csv files from each year.
+
+```{r records-checking}
+years = names(records)
+for (year in sort(years, decreasing=T)) {
+    cat(year, '\n')
+    print(list.files(records[year]))
+}
+```
+
+For two years `2023` and `2022`, the data is structured differently from the rest: there isn't a station file. It hints that the station's data is incoperated with the trips. We can confirm that by having a quick look at the datasets' structure.
+
+```{r data-check-2022-2023}
+for (year in c('2022', '2023')) {
+  file_name <- list.files(records[year])
+  file_path <- file.path(records[year], file_name)
+  cat(year, '\t', file_name, '\n')
+  # Print out the structure of the first 100 line from each dataset.
+  str(fread(cmd=paste('head -n 100', file_path)))
+}
+```
+
+We can see that both datasets from `2022` and `2023` contain the station names, and station districts as strings. Which isn't efficient for our analysis purposes. Therefore, in the next step, we'll de-couple the stations' names, districts, latitudes, and longitudes from the trip data and denote them as station IDs instead. In the datasets from `2021` and `2020`, the trip data and station data are already decoupled. Lastly, in the data from `2019`, there are data from multiple months that should be joined together to make a whole year dataset.
+
+Based on that observation, we'll have 3 chapters: 1) the `2023` and `2022` datasets, 2) the `2021` and `2020` datasets, and 3) the `2019` dataset.
+
+## 1. The 2023 and 2022 dataset.
+
+### 1.1 The 2023 dataset.
+
+In this project, we will utilize `data.table` library for storing dataframes and performing complex data wrangling tasks for its efficiency. In cases of light computation, standard `data.frames` operations are used for their aesthetics.
+
+```{r}
+data_2023 <- fread(file=file.path(records['2023'], 'DonneesOuvertes.csv'))
+str(data_2023)
+```
+
+As confirmed in the previous quick peek at the data, the columns `STARTSTATIONNAME`, `STARTSTATIONARRONDISSEMENT`, `ENDSTATIONNAME`, and `ENDSTATIONNAME` are all stored as strings, which is a quite inefficient use of memory for the data analysis purpose. Therefore, I'll split the data frame into 2 different dataframes. The first one contains the trip data: start station ID, start time, end station ID, and end time. The second one contains the station information: station ID, station name, station district, station latitude, and station longitude.
+
+Firstly, the column will be renamed for the sake of consistency. Also, all of the string columns (`chr` type) will be changed to `factor` datatype in R, which makes working with the data more efficient.
+
+```{r}
+data_2023_renamed <- data_2023 %>% 
+  mutate_if(is.character, trimws) %>% # Remove leading and trailing white spaces
+  mutate_if(is.character, as.factor) %>% # Change string datatype to R's factor
+  rename(start_station=STARTSTATIONNAME,
+    start_station_district=STARTSTATIONARRONDISSEMENT,
+    start_station_lat=STARTSTATIONLATITUDE,
+    start_station_long=STARTSTATIONLONGITUDE,
+    end_station=ENDSTATIONNAME,
+    end_station_district=ENDSTATIONARRONDISSEMENT,
+    end_station_lat=ENDSTATIONLATITUDE,
+    end_station_long=ENDSTATIONLONGITUDE,
+    start_time=STARTTIMEMS,
+    end_time=ENDTIMEMS)
+```
+
+Now, we'll extract all the distinct values of `station_name`, `lat`, `long`, and `district` from both the start stations and end stations.
+
+```{r}
+start_stations_2023 <- data_2023_renamed %>%
+  select(station_name=start_station,
+         lat=start_station_lat,
+         long=start_station_long,
+         district=start_station_district) %>%
+  distinct()
+
+end_stations_2023 <- data_2023_renamed %>%
+  select(station_name=end_station,
+         lat=end_station_lat,
+         long=end_station_long,
+         district=end_station_district) %>%
+  distinct()
+```
+
+The stations' information is now can be bound into a dataframe named `all_stations_2023`.
+
+```{r}
+all_stations_2023 <- rbind(start_stations_2023, end_stations_2023) %>%
+    distinct()
+```
+
+Next, let's check for duplicated using latitude and longitude. We can see that there are 19 coordinates that have at least 2 different station names.
+
+```{r}
+duplicated_coord_2023 <- all_stations_2023 %>%
+                           count(lat, long) %>%
+                           filter(n > 1)
+
+sprintf('Number of duplicated coordinates: %d', nrow(duplicated_coord_2023))
+```
+
+To extract the stations with duplicate coordinates, we can inner join the `duplicated_coord_2023` with the original data.
+
+```{r}
+duplicated_2023 <- duplicated_coord_2023[all_stations_2023, on=.(lat=lat, long=long),
+                                         nomatch=0] %>%
+                     arrange(cbind(lat, long)) %>%
+                     select(lat, long, station_name)
+
+# Display as scroll-able HTML box
+# Same group stations are denoted using a same color
+to_kbl <- duplicated_2023 %>%
+  group_by(lat, long) %>%
+  mutate(group_id=cur_group_id())
+
+kbl(to_kbl %>% select(-group_id)) %>%
+  kable_paper() %>%
+  column_spec(1:3, background=ifelse(to_kbl$group_id%%2==1, '#84dcc6', '#a5ffd6')) %>%
+  scroll_box(width='100%', height='450px')
+```
+
+My guess is that it can caused by legacy naming, or multiple kiosks at the same coordinate. For any reason, we can merge the stations which have the same coordinate together. The station ID is created using the row number.
+
+```{r}
+all_stations_2023_final <- all_stations_2023 %>%
+                             distinct(lat, long, .keep_all = TRUE) %>%
+                             mutate(id=1:nrow(.))
+```
+
+Now the stations dataframe is ready, we can join it back with the original dataset to have the `id` of start stations and end stations. In this case, I'll use the `data.table`'s joining method and left join the `data_2023_renamed` to the stations' data using `lat` and `long` as keys. Finally, we can have a quick view of the new dataframe that contains `id` of the start and end stations.
+
+```{r}
+station_to_merge_2023 <- all_stations_2023_final %>%
+                          select(lat, long, id)
+data_2023_renamed_ided <- data_2023_renamed[station_to_merge_2023,
+                                            on=.(start_station_lat=lat,
+                                                start_station_long=long)] %>%
+                            rename(start_station_id=id)
+data_2023_renamed_ided <- data_2023_renamed_ided[station_to_merge_2023,
+                                                  on=.(end_station_lat=lat,
+                                                       end_station_long=long)] %>%
+                            rename(end_station_id=id)
+str(data_2023_renamed_ided)
+```
+
+Next step, the `start_time` and `end_time` columns should be converted to `datetime` type. The timestamps (Unix epoch) have 13 digits, it should be for milliseconds timestamp. So first, we'll divide them by 1000, the using `as.POSIXct()` function to convert them into `YYYY-MM-DD HH:MM:SS`. Since there's no provided document, I assume the timezone argument `tz` should be `America/Toronto`. We can confirm the correctness by comparing the histogram of trips by the hour to the previous data with the time clearly recorded (i.e. 2020). Spoiler, it's correct.
+
+The trip data will now only contain `start_station_id`, `start_time`, `end_station_id`, and `end_time`.
+
+```{r}
+trips_2023_final <- data_2023_renamed_ided %>%
+                      select(start_station_id, start_time, end_station_id, end_time) %>%
+                      mutate(start_time=as.POSIXct(start_time/1000, origin='1970-01-01',
+                                                   tz='America/Toronto')) %>%
+                      mutate(end_time=as.POSIXct(end_time/1000, origin='1970-01-01',
+                                                 tz='America/Toronto'))
+
+hist(hour(trips_2023_final[, start_time]),
+     main='Trips historgram by hour',
+     xlab='Hour')
+```
+
+Finally, we'll store the cleaned data in the `data/processed` folders with the names `trips_2023.csv` and `stations_2023.csv` for trip data and station data respectively.
+
+```{r}
+processed_folder <- file.path('data', 'processed')
+# If the data/processed folder doesn't exist, create one.
+if (!dir.exists(processed_folder)){ 
+  dir.create(processed_folder)
+}
+
+# To keep the timestamps as-is without changing the system's timezone,
+# we use dateTimeAs='write.csv'
+fwrite(trips_2023_final, file.path(processed_folder, 'trips_2023.csv'),
+       dateTimeAs='write.csv')
+fwrite(all_stations_2023_final, file.path(processed_folder, 'stations_2023.csv'),
+       dateTimeAs='write.csv')
+```
+
+Bonus, let's check the size of the objects used for this dataset.
+
+```{r}
+objects_2023 <- ls()[grepl('2023', ls())]
+print(sapply(objects_2023, function(x) { 
+        format(object.size(get(x)), units='auto') })) 
+```
+
+We managed to scale down the 2023 data from `842.9 Mb` to around `253 Mb`. At this step, we can clear all these objects.
+
+```{r}
+rm(list=objects_2023)
+```
+
+### 1.2 The 2022 dataset.
+
+This dataset is quite similar to the 2023's. First, let's see what we have by loading the dataset into R's dataframe.
+
+```{r}
+data_2022 <- fread(file=file.path(records['2022'], 'DonneesOuverte2022.csv'))
+str(data_2022)
+```
+
+This time, we have 8.9 million records, instead of 11 million records as in 2023. Other than that, the structure is similar. So we'll continue by changing the string datatype to factor, then change the columns' names.
+
+```{r}
+data_2022_renamed <- data_2022 %>% 
+  mutate_if(is.character, trimws) %>% # Remove leading and trailing whitespaces
+  mutate_if(is.character, as.factor) %>% # Change string datatype to R's factor
+  rename(start_station=STARTSTATIONNAME,
+    start_station_district=STARTSTATIONARRONDISSEMENT,
+    start_station_lat=STARTSTATIONLATITUDE,
+    start_station_long=STARTSTATIONLONGITUDE,
+    end_station=ENDSTATIONNAME,
+    end_station_district=ENDSTATIONARRONDISSEMENT,
+    end_station_lat=ENDSTATIONLATITUDE,
+    end_station_long=ENDSTATIONLONGITUDE,
+    start_time=STARTTIMEMS,
+    end_time=ENDTIMEMS)
+```
+
+All of the stations are extracted from the data in a similar fashion as the 2023's.
+
+```{r}
+start_stations_2022 <- data_2022_renamed %>%
+  select(start_station, start_station_lat, start_station_long, start_station_district) %>%
+  distinct() %>%
+  setnames(new=c('station_name', 'lat', 'long', 'district'))
+
+end_stations_2022 <- data_2022_renamed %>%
+  select(end_station, end_station_lat, end_station_long, end_station_district) %>%
+  distinct() %>%
+  setnames(new=c('station_name', 'lat', 'long', 'district'))
+
+all_stations_2022 <- rbind(start_stations_2022, end_stations_2022) %>%
+    distinct()
+```
+
+Now let's check the duplicated coordinated.
+
+```{r}
+duplicated_coord_2022 <- all_stations_2022 %>%
+                          count(lat, long) %>%
+                          filter(n > 1)
+
+sprintf('Number of duplicated coordinates: %d', nrow(duplicated_coord_2022))
+
+duplicated_2022 <- duplicated_coord_2022[all_stations_2022, on=.(lat=lat, long=long),
+                                         nomatch=0] %>%
+                     arrange(cbind(lat, long)) %>%
+                     select(lat, long, station_name)
+
+to_kbl <- duplicated_2022 %>%
+  group_by(lat, long) %>%
+  mutate(group_id=cur_group_id())
+
+kbl(to_kbl %>% select(-group_id)) %>%
+  kable_paper() %>%
+  column_spec(1:3, background=ifelse(to_kbl$group_id%%2==1, '#84dcc6', '#a5ffd6')) %>%
+  scroll_box(width='100%', height='450px')
+```
+
+This time, we only have 10 coordinates that have more than 1 station name. Now we'll select all distinct stations (by latitude and longitude) and save them to `all_stations_2022_final` dataframe. This time, we also have a station without values, and we should keep it, too.
+
+```{r}
+all_stations_2022_final <- all_stations_2022 %>%
+                             distinct(lat, long, .keep_all = TRUE) %>%
+                             mutate(id=1:nrow(.))
+```
+
+Now the stations dataframe is ready, we can join it back with the original dataset to have the `id` of the start stations and end stations.
+
+```{r}
+station_to_merge_2022 <- all_stations_2022_final %>%
+                           select(lat, long, id)
+data_2022_renamed_ided <- data_2022_renamed[station_to_merge_2022,
+                                            on=.(start_station_lat=lat,
+                                                start_station_long=long)] %>%
+                            rename(start_station_id=id)
+data_2022_renamed_ided <- data_2022_renamed_ided[station_to_merge_2022,
+                                                  on=.(end_station_lat=lat,
+                                                       end_station_long=long)] %>%
+                            rename(end_station_id=id)
+str(data_2022_renamed_ided)
+```
+
+Next, as for the 2023 dataset, we'll use the `America/Toronto` timezone to convert the millisecond Unix epoch to the `YY-MM-DD HH:MM:SS` format. We'll also need to plot a histogram of trip frequency by hour for timezone confirmation.
+
+```{r}
+trips_2022_final <- data_2022_renamed_ided %>%
+                      select(start_station_id, start_time, end_station_id, end_time) %>%
+                      mutate(start_time=as.POSIXct(start_time/1000, origin='1970-01-01',
+                                                   tz='America/Toronto')) %>%
+                      mutate(end_time=as.POSIXct(end_time/1000, origin='1970-01-01',
+                                                 tz='America/Toronto'))
+
+hist(hour(trips_2022_final[, start_time]),
+     main='Trips historgram by hour',
+     xlab='Hour')
+```
+
+Now we can store the data into the trips and stations data in csv format in the `data/processed` folder.
+
+```{r}
+# processed_folder <- file.path('data', 'processed')
+# If the data/processed folder doesn't exist, create one.
+if (!dir.exists(processed_folder)){ 
+  dir.create(processed_folder)
+}
+
+# To keep the timestamps as-is without changing the system's timezone,
+# we use dateTimeAs='write.csv'
+fwrite(trips_2022_final, file.path(processed_folder, 'trips_2022.csv'),
+       dateTimeAs='write.csv')
+fwrite(all_stations_2022_final, file.path(processed_folder, 'stations_2022.csv'),
+       dateTimeAs='write.csv')
+```
+
+Finally, let's check the dataframe's size and remove the unused ones.
+
+```{r}
+objects_2022 <- ls()[grepl('2022', ls())]
+print(sapply(objects_2022, function(x) { 
+        format(object.size(get(x)), units='auto') }))
+rm(list=objects_2022)
+```
+
+## 2. The 2021 and 2020 dataset.
+
+### 2.1 The 2021 dataset.
+
+This dataset is better structured with the trips and stations in separate files.
+
+```{r}
+list.files(records['2021'])
+```
+
+Let's have a look at the dataframes' structure.
+
+```{r}
+trips_2021 <- fread(file=file.path(records['2021'], '2021_donnees_ouvertes.csv'))
+stations_2021 <- fread(file=file.path(records['2021'], '2021_stations.csv'))
+cat('Trips data', '\n')
+str(trips_2021)
+cat('Station data', '\n')
+str(stations_2021)
+```
+
+For 2021, we have around 5.5 million trips. Other than the stations and timestamps, this trip data also contains `duration_sec` and `is_member`. The timestamps are properly stored in the `YY-MM-DD HH:MM:SS` format. From the structure, we can see that `pk` column will now be the stations' ID.
+
+As usual, I'll start will the name changing.
+
+```{r}
+trips_2021_renamed <- trips_2021 %>% 
+                        rename(start_station_id=emplacement_pk_start,
+                               start_time=start_date,
+                               end_station_id=emplacement_pk_end,
+                               end_time=end_date)
+stations_2021_renamed <- stations_2021 %>%
+                           rename(id=pk,
+                                  station=name,
+                                  lat=latitude,
+                                  long=longitude)
+```
+
+Now let's check if there's any coordinate redundancy in the station data.
+
+```{r}
+duplicated_coord_2021 <- stations_2021_renamed %>%
+                           count(lat, long) %>%
+                           filter(n > 1)
+
+sprintf('Number of duplicated coordinates: %d', nrow(duplicated_coord_2021))
+
+duplicated_2021 <- duplicated_coord_2021[stations_2021_renamed, on=.(lat=lat, long=long),
+                                         nomatch=0] %>%
+                     arrange(cbind(lat, long)) %>%
+                     select(id, lat, long, station, n)
+glimpse(duplicated_2021)
+```
+
+So, there are 28 coordinates with more than 2 stations. There are a few possible ways to deal with the duplicates: 1) Change the station's IDs in the `trips` dataframe of the duplicated stations to the representative station's ID; 2) Create a second ID column in the `stations` dataframe that address the same group of stations those have the same coordinate as one, or 3) Change the station names in the `stations` dataframe, those have the same coordinate to the representative station name of that coordinate. To keep the consistency with the previously processed dataset, we'll apply the first method: changing the IDs of the stations in the `trips` dataset.
+
+So first, we'll need to extract the `id`s that we want to replace, as well as the `id`s that replace them. And apply a mapping transition to our latest dataframe: `trips_2021_renamed`. Since we already have the `duplicated_2021` dataframe that contains the stations that have the same coordinate, we can use self-join on the same `lat` and `long` values, with the join's left-hand size `id` greater than the other one. The result after this step can be as follows.
+
+| old_id | new_id | number_of_duplicates |
+|:-------|:------:|---------------------:|
+| id2    |  id1   |                    2 |
+| id4    |  id3   |                    3 |
+| id5    |  id3   |                    3 |
+| id5    |  id4   |                    3 |
+
+To avoid that, we can simply use `distinct()` to remove any duplicated `id` belonging to the to-be-replaced group.
+
+```{r}
+id_changes_2021 <- duplicated_2021[duplicated_2021, .(x.id, i.id),
+                                        on=.(lat=lat, long=long, id>id), nomatch=0] %>%
+                          rename(old=x.id, new=i.id) %>%
+                          distinct(old, .keep_all=T)
+glimpse(id_changes_2021)
+```
+
+After obtaining the `id`s for changing in the `id_changes_2021` dataframe, we can change the corresponding `id`s in `trips_2021_renamed` using update join procedures in `data.table`.
+
+```{r}
+trips_2021_final <- trips_2021_renamed
+trips_2021_final[id_changes_2021, on=.(start_station_id=old), start_station_id:=new]
+trips_2021_final[id_changes_2021, on=.(end_station_id=old), end_station_id:=new]
+```
+
+We also should remove the stations with duplicate coordinates in the `station_2021_renamed` dataframe. To ensure consistency of what station we want to keep, we should sort the rows by both `lat` and `long` and use `distinct()` to remove the duplicate.
+
+```{r}
+stations_2021_final <- stations_2021_renamed %>%
+                         arrange(cbind(lat, long)) %>%
+                         distinct(lat, long, .keep_all=T)
+```
+
+Now let's plot the histogram by hour of the 2021's trips and see if it's similar to the one from the later years.
+
+```{r}
+hist(hour(trips_2021_final[, start_time]),
+     main='Trips historgram by hour',
+     xlab='Hour')
+```
+
+Finally, we can save the file to the `data/processed` folder.
+
+```{r}
+#processed_folder = file.path('data', 'processed')
+if (!dir.exists(processed_folder)){ 
+  dir.create(processed_folder)
+}
+fwrite(trips_2021_final, file.path(processed_folder, 'trips_2021.csv'))
+fwrite(stations_2021_final, file.path(processed_folder, 'stations_2021.csv'))
+```
+
+As we are done working with this dataset, let's remove the unused objects from the memory.
+
+```{r}
+objects_2021 <- ls()[grepl('2021', ls())]
+print(sapply(objects_2021, function(x) { 
+        format(object.size(get(x)), units='auto') }))
+rm(list=objects_2021)
+```
+
+### 2.2 The 2020 dataset.
+
+The 2020 dataset is similar to the 2021 dataset, with the trips and stations data coming in separated files and can be joined together using station ID.
+
+```{r}
+list.files(records['2020'])
+```
+
+Here are the dataframe's structures.
+
+```{r}
+trips_2020 <- fread(file=file.path(records['2020'], 'OD_2020.csv'))
+stations_2020 <- fread(file=file.path(records['2020'], 'stations.csv'))
+cat('Trips data', '\n')
+str(trips_2020)
+cat('Station data', '\n')
+str(stations_2020)
+```
+
+For the 2020 dataset, we have around 3.26 million trips. Other than the stations and timestamps, this trip data also contains `duration_sec` and `is_member`. The timestamps are properly stored in the `YY-MM-DD HH:MM:SS` format. From the structure, we can see that `pk` column will now be the stations' ID.
+
+As usual, we'll start will the name changing.
+
+```{r}
+trips_2020_renamed <- trips_2020 %>% 
+                        rename(start_station_id=start_station_code,
+                               start_time=start_date,
+                               end_station_id=end_station_code,
+                               end_time=end_date)
+stations_2020_renamed <- stations_2020 %>%
+                           rename(id=code,
+                                  station=name,
+                                  lat=latitude,
+                                  long=longitude)
+```
+
+Now let's check if there's any coordinate redundancy in the station data.
+
+```{r}
+duplicated_coord_2020 <- stations_2020_renamed %>%
+                           count(lat, long) %>%
+                           filter(n > 1)
+
+sprintf('Number of duplicated coordinates: %d', nrow(duplicated_coord_2020))
+
+duplicated_2020 <- duplicated_coord_2020[stations_2020_renamed, on=.(lat=lat, long=long),
+                                         nomatch=0] %>%
+                     arrange(cbind(lat, long)) %>%
+                     select(id, lat, long, station, n)
+glimpse(duplicated_2020)
+```
+
+Fortunately, there are no duplicate stations in this dataset. So we are all set and can save the data to the `processed` folder.
+
+```{r}
+#processed_folder = file.path('data', 'processed')
+if (!dir.exists(processed_folder)){ 
+  dir.create(processed_folder)
+}
+fwrite(trips_2020_renamed, file.path(processed_folder, 'trips_2020.csv'))
+fwrite(stations_2020_renamed, file.path(processed_folder, 'stations_2020.csv'))
+
+objects_2020 <- ls()[grepl('2020', ls())]
+print(sapply(objects_2020, function(x) { 
+        format(object.size(get(x)), units='auto') }))
+rm(list=objects_2020)
+```
+
+## 3. The 2019 dataset.
+
+The last dataset that needs to be pre-processed is from 2019. It consists of 7 `csv` files from April to October for trip file and a station file.
+
+```{r}
+list.files(records['2019'])
+```
+
+First, we'll read the station file named `Stations_2019.csv` into a dataframe and rename the columns.
+
+```{r}
+stations_2019 <- fread(file=file.path(records['2019'], 'Stations_2019.csv'))
+str(stations_2019)
+```
+
+We can see that the `stations_2019`'s structure is similar to the ones from 2020 and 2021. Next, we'll load the trip data to an R `list` called `data_2019_seperate` and discover their structure.
+
+```{r}
+data_2019_seperate <- list()
+# From the folder, load all files with "OD" in its name.
+for (file in list.files(records['2019'], pattern='OD', full.names=T)){
+  cat(file, '\n')
+  m <- str_extract(file, '\\d+(?=\\.csv)')
+  data_2019_seperate[[m]] <- fread(file)
+  str(data_2019_seperate[[m]])
+}
+```
+
+We can see that all files are structured properly, except for the data from August: `data/raw_csv/2019/OD_2019-08.csv`. Both the `start_station_code` and `end_station_code` are read as strings instead of integers. To find out what has happened, we can use the regular expression `[^\\d]` (`[^]` to denote anything except and `\\d`(or `[:digit:]`) is for digits) to find the rows that contain non-numerical values.
+
+```{r}
+data_2019_seperate[['08']][
+  str_detect(start_station_code, regex("[^\\d]")) |
+  str_detect(end_station_code, regex("[^\\d]"))]
+```
+
+So turns out, there are three rows with both `start_station_code` and `end_station_code` are `MTL-ECO5.1-01`. We can safely discard them by converting the station codes columns to integers and removing the null values.
+
+```{r}
+data_2019_seperate[['08']] <- data_2019_seperate[['08']] %>%
+                                mutate(start_station_code=as.integer(start_station_code)) %>%
+                                mutate(end_station_code=as.integer(end_station_code)) %>%
+                                na.omit(cols=c('start_station_code', 'end_station_code'))
+nrow(data_2019_seperate[['08']])
+```
+
+Don't worry, the warnings are for these 3 rows above. Now we have a new dataframe with 3 rows lest than the original. Now all the parts are correctly formated, we can join them together as well as change the columns' names.
+
+```{r}
+trips_2019 <- rbindlist(data_2019_seperate) %>%
+                rename(start_station_id=start_station_code,
+                       start_time=start_date,
+                       end_station_id=end_station_code,
+                       end_time=end_date)
+```
+
+Now let's change the `stations_2019`'s column names and check if there's any coordinate redundancy in the station data.
+
+```{r}
+stations_2019_renamed <- stations_2019 %>%
+                           rename(id=Code,
+                                  station=name,
+                                  lat=latitude,
+                                  long=longitude)
+
+duplicated_coord_2019 <- stations_2019_renamed %>%
+                           count(lat, long) %>%
+                           filter(n > 1)
+
+sprintf('Number of duplicated coordinates: %d', nrow(duplicated_coord_2019))
+
+duplicated_2019 <- duplicated_coord_2019[stations_2019_renamed, on=.(lat=lat, long=long), nomatch=0] %>%
+                     arrange(cbind(lat, long)) %>%
+                     select(id, lat, long, station, n)
+duplicated_2019
+```
+
+This time, there are no duplicate stations in this dataset. So we are all set and can save the data to the `processed` folder.
+
+```{r}
+#processed_folder = file.path('data', 'processed')
+if (!dir.exists(processed_folder)){ 
+  dir.create(processed_folder)
+}
+fwrite(trips_2019, file.path(processed_folder, 'trips_2019.csv'))
+fwrite(stations_2019_renamed, file.path(processed_folder, 'stations_2019.csv'))
+
+objects_2019 <- ls()[grepl('2019', ls())]
+print(sapply(objects_2019, function(x) { 
+        format(object.size(get(x)), units='auto') }))
+rm(list=objects_2019)
+```

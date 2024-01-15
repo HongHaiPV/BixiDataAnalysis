@@ -1,0 +1,512 @@
+---
+title: 'BIXI Part 2: Fleet expansion analysis: How many bikes should be added to the current fleet?'
+output: html_document
+author: 'Phan Vu-Hong-Hai'
+date: "Last updated on `r format(Sys.time(), '%d %B, %Y')`"
+---
+
+```{r, message=FALSE}
+library(data.table)
+library(tidyverse)
+library(knitr)
+
+library(dygraphs) # For interactive plots
+library(xts) # For timeseries
+
+library(patchwork) # For aligning the plots
+
+# Remove the comments in the outputs
+knitr::opts_chunk$set(comment=NA)
+```
+
+## 1. Data
+
+In this project, we will work with the BIXI open data: [BIXI open data website](https://bixi.com/en/open-data/). BIXI is a public bike-sharing system serving the Montréal metropolitan and is North America's first large-scale bike-sharing system. Before 2023, BIXI is only available from April to November and the highest demand happens around the middle of summer.
+
+The demand for BIXI's service is increasing by the year. So the interesting question is how many more bikes are needed to serve the demand of the next summer, 2024. In this analysis, we will base on historical data only to provide this forecast. The data used is from the year of 2019 to 2023. For 2023, the cutoff month is November. The data has been pre-processed in the previous work.
+
+First, the trips data and station data are loaded into `trips_data` list and `stations_data` list respectively. Each list is named by the year that the data comes from. The `trips_data` contains `start_station_id`, `start_time`, `end_station_id`, and `end_time`. Some data sets will also contain `is_member` and `trip_duration`, however, in this analysis, we are not using them. The `stations_data` contains `id`, `station`(the name), `lat`, and `long`.
+
+```{r, results='hide'}
+# Output is suppressed using results='hide'
+FILE_PATH <- 'data/processed'
+trips_data = list()
+# Read all the csv file contains "trips" keyword
+trips_files <- list.files(path=FILE_PATH, pattern='^trips', full.names=T)
+for (trips_file in trips_files) {
+  # Extract the year string using regex
+  year <- str_extract(trips_file, '\\d+')
+  cat(year, '\n')
+  trips_data[[year]] <- fread(trips_file)
+  cat(str(trips_data[[year]]), '\n')
+}
+```
+
+**WARNING: For consistency and performance reasons, the timezone of all data is defaulted to UTC and interpreted as if they were local time.**
+
+```{r, results='hide'}
+# Output is suppressed using results='hide'
+stations_data = list()
+# Read all the csv file contains "stations" keyword
+stations_files <- list.files(path=FILE_PATH, pattern='^stations', full.names=T)
+for (stations_file in stations_files) {
+  # Extract the year string using regular expression \\d+
+  year <- str_extract(stations_file, '\\d+')
+  cat(year, '\n')
+  stations_data[[year]] <- fread(stations_file)
+  cat(str(stations_data[[year]]), '\n')
+}
+```
+
+We are concentrating on the number of concurrent trips at any given time, or in other words, network utilization. So first, we should make sure the time stamp data are clean. To do so, we need to remove all the rows that:
+
+-   `start_time` or `end_time` field contains null value.
+-   `start_time` is greater than `end_time`.
+-   `start_time` or `end_time` is from a different year.
+
+Here is the result:
+
+```{r}
+for (year in names(trips_data)) {
+  cat(year, '\n')
+  # Get the current year and the next year to compare with the timestamps
+  # in the data set
+  year_start <- floor_date(as.Date(year, format='%Y'), unit='year')
+  year_plus1_start <- floor_date(as.Date(as.character(as.numeric(year)+1),
+                                         format='%Y'), unit='year')
+  # Number of rows before deleting
+  prev_nrows <- nrow(trips_data[[year]])
+  # Remove all rows that start_time is NULL or end_time is NULL or start_time >
+  # end_time or start_time or end_time is outside of the current year
+  trips_data[[year]] <- trips_data[[year]][!((start_time > end_time) |
+                                               (start_time < year_start) |
+                                               (end_time >= year_plus1_start))]
+  # Number of rows after deleting
+  curr_nrows <- nrow(trips_data[[year]])
+  cat('Dropped :', prev_nrows-curr_nrows, '\n')
+  cat('Remain :', curr_nrows, '\n')
+}
+```
+
+The total data is about 29.3 million rows.
+
+## 2. Data explorations
+
+Next step, let's have a quick look at the data. This time, we can use a `histogram` to show the distribution of trips by the initiated hours. To do so, we can first group the trips by hour and count them using the `group_by` operation from `data.table` and re-construct a `histogram` plot using `bar` plot.
+
+```{r}
+trips_by_hour <- list()
+for (year in names(trips_data)) {
+  # Group the trips by start hour and count using data.table convention
+  trips_by_hour[[year]] <- trips_data[[year]][, .N, by=lubridate::hour(start_time)]
+}
+# Bind all dataframes in the list to a large one
+binded_trips_by_hour <- rbindlist(trips_by_hour, idcol=T)
+```
+
+The plot is generated using R's `ggplot2` with the year encoded by colors.
+
+```{r}
+ggplot(binded_trips_by_hour, aes(x=lubridate, y=N, fill=as.factor(.id))) +
+  geom_bar(stat='identity', position='dodge') +
+  labs(title='Trips distribution by hour (2019-2023)',
+       x='Start-time (hour)',
+       y='Count',
+       fill='Year') +
+   scale_x_continuous(n.breaks=24)
+```
+
+From the chart, we can see that the number of trips steadily increased over the year, except for `2020` and `2021`, when the pandemic happened and curfew orders were in place. One interesting observation is there are two spikes in the using patterns: The first spike happens around 8 am and the second, larger spike happens around 5 pm.
+
+Now, let's repeat the process for the trips' distribution based on the day of the week.
+
+```{r}
+trips_by_wday <- list()
+for (year in names(trips_data)) {
+  # Group the trips by weekday using start time and count using data.table convention
+  trips_by_wday[[year]] <- trips_data[[year]][, .N,
+                                      by=lubridate::wday(end_time, label=T)]
+}
+# Bind all dataframes in the list to a large one
+binded_trips_by_wday <- rbindlist(trips_by_wday, idcol=T)
+
+ggplot(binded_trips_by_wday, aes(x=lubridate, y=N, fill=as.factor(.id))) +
+  geom_bar(stat='identity', position='dodge') +
+  labs(title='Trips distribution by weekday (2019-2023)',
+       x='Weekday',
+       y='Count',
+       fill='Year')
+```
+
+We can observe that the average busiest days of the week are not fixed throught the years. For 2023, it's Friday. For 2022, 2021, and 2020, it's around Friday and Saturday. Meanwhile in 2019, it's Wednesday.
+
+Another interesting aspect is the change of the average trip length throughout the years.
+
+```{r}
+# Calculate the average trip length in minutes unit
+avg_trips_time <- lapply(trips_data, function(x) mean(difftime(x$end_time,
+                                                               x$start_time,
+                                                               units='mins')))
+# Convert to long-form for plotting
+avg_trips_time_dt <- pivot_longer(data.table(do.call(cbind, avg_trips_time)),
+                                  cols=1:5, names_to='year',
+                                  values_to='avg_length')
+
+ggplot(avg_trips_time_dt, aes(x=year, y=avg_length, group=1)) +
+  geom_line(color='grey') +
+  geom_point(shape=21, color="black", fill="#69b3a2", size=3) + 
+  labs(title='Average trip length (2019-2023)',
+       x='Year',
+       y='Minutes')
+```
+
+Based on the graph, the average trip length seems to be increasing, but inconsistent. Now that we have had some idea about the changes over the years, let's move on to the core part of predicting the number of bikes that we should add to the rank.
+
+## 3. Network utilization forecasting
+
+Optimal fleet size calculating was never an easy feat. There are many factors that need to be considered when it comes to the decisions: the demands in both the short and long term, the hardware costs, the return on investment, logistical constraints, etc. In this work, we have the convenience of only addressing the fleet size problem from the historical data.
+
+Here, network utilizations are defined as the number of concurrence trips in the network, or in other words, the number of active bikes. Since these figures are from historical data, the real demands should at least exceed those. Therefore, the highest number of active bikes should be a good lower bound to estimate the number of needed vehicles.
+
+To calculate the number of concurrence trips, we need to scan the whole data set at any given timestamp and count the number of active trips, the ones that started but haven't yet ended. It's possible to count those numbers using the highest resolution in terms of time units (for example, milliseconds), but it isn't necessary. In practice, a 2-minute interval time unit should be good enough. To do so in R, we can use the `foverlaps()` function. In essence, `foverlaps()` will look for the indices of the `start_time` and the `end_time` in a reference data table using binary search and assigns these to the corresponding rows in the original data table.
+
+```{r}
+trips_at_atime <- list()
+lookup_by_year <- list()
+for (year in names(trips_data)) {
+  curr_data <- trips_data[[year]]
+  min_time <- min(curr_data$start_time)
+  max_time <- max(curr_data$end_time)
+  # Create a sequence of time steps by every 2-minute interval
+  time_seq <- seq(min_time, max_time, by="2 mins")
+  # Build a lookup table with the start and the end of each row is two time 
+  # step of 2 minutes each
+  lookup <- data.table(start=head(time_seq, -1), end=tail(time_seq, -1),
+                       key=c('start', 'end'))
+  lookup_by_year[[year]] <- lookup
+  # Using foverlaps() function to perform binary search
+  overlap_join <- foverlaps(curr_data, lookup, by.x=c('start_time', 'end_time'),
+                   by.y=c('start', 'end'), type='any', which=TRUE)
+  # Perform the group_by process, by the time interval's id, and count the number
+  # of trips
+  trips_at_atime[[year]] <- overlap_join[, .N, by=yid]
+}
+```
+
+One might wonder what is the difference between counting the number of active bikes in a time unit and counting the number of initiated trips in the same time unit. To answer that, let's take a look at the graph below.
+
+```{r, warning=F}
+year <- '2023'
+time_limit <- as.POSIXct(c('2023-08-01', '2023-08-02'))
+trips <- trips_at_atime[[year]]
+intervals <- lookup_by_year[[year]]
+# Convert the yid to time value
+trips$start_time <- intervals[trips$yid]$start
+
+# Line plot for the number of active bikes by 2 mins interval
+p1 <- ggplot(trips, aes(x=start_time, y=N)) +
+           geom_line() +
+           xlim(time_limit) +
+           labs(title='Number of active trips by 2 mins unit (2023)',
+                  x='Time',
+                  y='Count')
+
+# Count the number of trips initiated every 2 mins
+# There'll be mismatch compared to the previous, but they are insignificant
+trips_by_2min <- trips_data[[year]][, .N, by=round_date(start_time, '2 mins')]
+p2 <- ggplot(trips_by_2min, aes(x=round_date, y=N)) +
+           geom_line()  +
+           xlim(time_limit) +
+           labs(title='Number of trips initiated every 2 mins (2023)',
+                  x='Time',
+                  y='Count')
+
+# Plot p1, and p2 into a horizontal layout using the patchwork library
+p1 + p2 + plot_layout(nrow=2)
+```
+
+We can clearly see that the number of in-use bikes at every period is significantly larger than the number of bikes that get started to be used. Hence, the number of active bikes represents the real demands on vehicles more closely. The following interactive chart using `dygraphs` shows the utilization of the BIXI network in 2023, defaulted to zoom-in the week from the 13th to the 19th of August.
+
+```{r}
+year <- '2023'
+default_start <- as.POSIXct(c('2023-08-13', '2023-08-19'))
+                            
+# Convert data.table to xts time series format
+data_xts <- xts(x=trips$N, order.by=trips$start_time)
+
+# Finally the plot
+p <- dygraph(data_xts) %>%
+  # Remember to use useDataTimezone=TRUE to correctly display the time
+  dyOptions(useDataTimezone=T, fillGraph=T, fillAlpha=0.1, drawGrid=T, colors='#ff6600') %>%
+  dyRangeSelector(dateWindow=default_start) %>%
+  dyCrosshair(direction='vertical') %>%
+  dyHighlight(highlightCircleSize=5, highlightSeriesBackgroundAlpha=0.2, hideOnMouseOut=F)  %>%
+  dyRoller(rollPeriod=1)
+p
+```
+
+Now, let's decide on how to use this information to answer the main question: how many new vehicles should we add for the next year, anticipating the future demand? I propose we use the top 95th, 99th, 99.9th percentile, and the maximum network utilization to perform linear regression and predict the year of 2024's demand. These percentiles are extracted using `quantile` function. But first, let's bind the concurrence trip counter to one dataframe. To do so, we'll use `data.table`'s binding method. It'll create a new column named `.id` that contains the year the data comes from.
+
+```{r}
+# Define the interested percentiles: 95, 99, 99.9, and maximum
+cutoff <- c(0.95, 0.99, 0.999, 1.0)
+binded_counter <- rbindlist(trips_at_atime, idcol=T) %>%
+                    rename(year=.id)
+top_percentiles <- binded_counter %>%
+                      group_by(year) %>%
+                      summarize(top_95th=quantile(N, prob=cutoff[1]),
+                                top_99th=quantile(N, prob=cutoff[2]),
+                                top_999th=floor(quantile(N, prob=cutoff[3])),
+                                max=quantile(N, prob=cutoff[4]))
+top_percentiles %>% rmarkdown::paged_table()
+```
+
+We can see that the utilizations, in general, have increased throughout the years. For example, in 2023, 95% of the time the network utilized less than 1673 bikes, and 99.9% of the time there were less than 2296 bikes in use. While these numbers for 2019 are just 851 and 1385. The exceptions are for 2020 and 2021 and it's understandable since there are multiple restrictions caused by the pandemic. Now let's plot the density chart of the utilizations.
+
+```{r}
+ggplot(binded_counter, aes(x=N, group=year, fill=year)) +
+  geom_density(adjust=1.5, alpha=.4) +
+  facet_wrap(~year) +
+  theme(
+      legend.position='none',
+      panel.spacing = unit(0.1, 'lines'),
+      axis.ticks.x=element_blank()
+    ) +
+   labs(title='BIXI network utilization (2019-2023)',
+          x='Concurence trips',
+          y='Density')
+```
+
+The distributions are all long tails and can be divided into three groups:
+
+1.  Group 1 contains 2019 and 2021 with similar shapes: the tails are clearly separated from the bulk starting around the 1000 mark.
+2.  Group 2 contains only 2020, where there's a greater peak above zero, suggesting low utilization and may be prevalent in short trips.
+3.  Group 3 contains 2022 and 2023, where the utilization is better distributed and has a trend of increasing utilization.
+
+It's also worth noting that the act of network balancing is not clearly stated in the data description, so there may be contamination.
+
+Then, how many vehicles should we add to the fleet for the next year? Adding too many and it's a waste of resources. Adding too little and users' satisfaction decreases. It should be clearer when we take a look at the following chart.
+
+```{r}
+all_train_data <- top_percentiles %>%
+                    mutate(year=as.integer(year)) %>%
+                    pivot_longer(cols=top_95th:max, names_to='percentile')
+
+# Change factor levels for better ordered legend labels
+all_train_data$percentile <- factor(all_train_data$percentile,
+                               levels=c('max', 'top_999th', 'top_99th', 'top_95th'))
+
+util_plot <- ggplot(all_train_data, aes(x=year, y=value, color=percentile)) +
+                geom_point(aes(shape=percentile, color=percentile)) +
+                labs(title='BIXI network utilization percentiles (2019-2023)',
+                     x='Year',
+                     y='Active bikes',
+                     color='Percentile',
+                     shape='Percentile')
+util_plot
+```
+
+Clearly, there is a huge drop in 2020 and 2021. So now we have to decide which data points that should be used. I propose two scenarios:
+
+1.  Ignore the data from 2020 and 2021, with the assumption they are affected by artificial restrictions. We will call it the **conservative scenario**, since the intercept angle is lowest.
+2.  Ignore the data from 2019 and 2020, with the assumption the users' behavior has changed after the pandemic. We will call it the **aggressive scenario**, since the intercept angle is highest.
+
+All in all, we can use a simple linear regression model to determine a lower bound of how many we should add to the fleet based on the percentiles.
+
+### 3.1 Conservative scenario: Forecast with data from 2019, 2022 and 2023
+
+First, we have to filter out the data from the year 2020 and 2021. After that, we will fit the data using linear regression with the target variable as the number of active bikes and the input variable as the year. Since it's linear regression, there's no need to change the input variable.
+
+```{r}
+sc1_train_data <- all_train_data %>%
+                    filter(year!=2020 & year!=2021)
+# Fit the linear model for each group of percentile
+sc1_lms <- sc1_train_data %>%
+              group_by(percentile) %>%
+              do(model=lm(value~year, data=.))
+```
+
+Now let's fit the model back to the original data, plus the year 2024.
+
+```{r}
+years <- 2019:2024
+# Create the original wide form data table to store the result
+sc1_all_pred <- data.frame(percentile=sc1_lms$percentile)
+for (year in years) {
+  sc1_all_pred[[as.character(year)]] <- lapply(sc1_lms$model, 
+                                               predict,
+                                               # repeat the year 4 times for 4
+                                               # type of percentiles
+                                               list(rep(year, times=4))) %>%
+                                        unlist() %>%
+                                        as.integer()
+  
+}
+# Convert the result to long form
+sc1_all_pred <- pivot_longer(sc1_all_pred, cols=2:7, names_to='year')
+sc1_all_pred$year <- as.integer(sc1_all_pred$year )
+sc1_2024 <- filter(sc1_all_pred, year=='2024')
+sc1_all_pred %>% rmarkdown::paged_table()
+```
+
+Now let's plot the regression lines and the predicted values for 2024.
+
+```{r}
+# Get the current maximum capacity
+max_cap <- max(all_train_data$value)
+# Create labels for the predicted values
+predict_legends <- case_when(sc1_2024$value > max_cap ~ 
+                              paste(sc1_2024$value,
+                                    ' (+', sc1_2024$value-max_cap,
+                                    ')', sep=''),
+                             .default = as.character(sc1_2024$value))
+
+sc1_plot <- ggplot(sc1_train_data,
+                   aes(x=year, y=value, color=percentile)) +
+            geom_point(aes(shape=percentile, color=percentile)) +
+            # Regression lines
+            geom_line(data=sc1_all_pred,
+                      aes(x=year, y=value, linetype=percentile, color=percentile),
+                      inherit.aes=F,
+                      show.legend=T) +
+            # Predicted data points for 2024
+            geom_point(data=sc1_2024,
+                       aes(x=year, y=value, shape=percentile, color=percentile)) +
+            # Denote the predicted values
+            geom_text(data=sc1_2024, aes(x=year, y=value),
+                       label=predict_legends,
+                       nudge_x=0.1,
+                       hjust='outward',
+                       show.legend=F) +
+            labs(title='Linear regressions (2019, 2022, 2023), 2024 forecast',
+                     x='Year',
+                     y='Active bikes',
+                     color='Percentile',
+                     shape='Percentile',
+                     linetype='Percentile') +
+            xlim(2019, 2024.9) +
+            geom_hline(yintercept=max_cap, linetype='dashed', color='black')
+
+sc1_plot
+```
+
+**Key conclusion - Conservative scenario:** From the linear regression results, in order to satisfy 2024's demand, we need to add about **54 more bikes** with 100% efficiency (all are used in the peak demand) or **54/max_cap = `r format(54/max_cap*100, digits=2)`% more bikes** when adding the bike equally to all stations. For other demand percentiles, we don't need to add anything.
+
+About the confidence of the forecasting, it's low. Only 84% of the data variations can be explained by the model and the insignificant p-values. This suggests there are other variables that are not considered for the forecast, or the assumption of the linear model is not exactly correct.
+
+```{r}
+# Extract summary for the linear regression based on maximum capacity
+summary(sc1_lms$model[[1]])
+```
+
+### 3.2 Aggressive Scenario: Forecast with data from 2021 to 2023
+
+First, we have to filter out the data from the year 2019 and 2020. After that, we will fit the data using linear regression with the target variable as the number of active bikes and the input variable as the year. Since it's linear regression, there's no need to change the input variable.
+
+```{r}
+sc2_train_data <- all_train_data %>%
+                    filter(year!=2019 & year!=2020)
+# Fit the linear model for each group of percentile
+sc2_lms <- sc2_train_data %>%
+              group_by(percentile) %>%
+              do(model=lm(value~year, data=.))
+```
+
+Now let's fit the model back to the original data, plus the year 2024.
+
+```{r}
+year <- 2019:2024
+# Create the original wide form data table to store the result
+sc2_all_pred <- data.frame(percentile=sc2_lms$percentile)
+for (year in years) {
+  sc2_all_pred[[as.character(year)]] <- lapply(sc2_lms$model, 
+                                               predict,
+                                               # repeat the year 4 times for 4
+                                               # type of percentiles
+                                               list(rep(year, times=4))) %>%
+                                        unlist() %>%
+                                        as.integer()
+  
+}
+# Convert the result to long form
+sc2_all_pred <- pivot_longer(sc2_all_pred, cols=2:7, names_to='year')
+sc2_all_pred$year <- as.integer(sc2_all_pred$year )
+sc2_2024 <- filter(sc2_all_pred, year=='2024')
+sc2_all_pred %>% rmarkdown::paged_table()
+```
+
+Now let's plot the regression lines and the predicted data for 2024.
+
+```{r}
+# Get the current maximum capacity
+max_cap <- max(all_train_data$value)
+# Create labels for the predicted values
+predict_legends <- case_when(sc2_2024$value > max_cap ~ 
+                              paste(sc2_2024$value,
+                                    ' (+', sc2_2024$value-max_cap,
+                                    ')', sep=''),
+                             .default = as.character(sc2_2024$value))
+
+sc2_plot <- ggplot(sc2_train_data,
+                   aes(x=year, y=value, color=percentile)) +
+            geom_point(aes(shape=percentile, color=percentile)) +
+            # Regression lines
+            geom_line(data=sc2_all_pred,
+                      aes(x=year, y=value, linetype=percentile, color=percentile),
+                      inherit.aes=F,
+                      show.legend=T) +
+            # Predicted data points for 2024
+            geom_point(data=sc2_2024,
+                       aes(x=year, y=value, shape=percentile, color=percentile)) +
+            # Denote the predicted values
+            geom_text(data=sc2_2024, aes(x=year, y=value),
+                       label=predict_legends,
+                       nudge_x=0.1,
+                       hjust='outward',
+                       show.legend=F) +
+            labs(title='Linear regressions (2020-2023), 2024 forecast',
+                     x='Year',
+                     y='Active bikes',
+                     color='Percentile',
+                     shape='Percentile',
+                     linetype='Percentile') +
+            xlim(2019, 2024.9) +
+            geom_hline(yintercept=max_cap, linetype='dashed', color='black',
+                       alpha=.5)
+
+sc2_plot
+```
+
+**Key conclusion - Aggressive scenario:** From the linear regression results, in order to satisfy 2024's peak demand, we need to add about **696 more bikes** with 100% efficiency (all are used in the peak demand) or **696/max_cap = `r format(696/max_cap*100, digits=2)`% more bikes** when adding the bike equally to all stations. Or, to satisfy 99.9% of all demands, we will need to add about **361 more bikes** with 100% efficiency or **361/max_cap = `r format(361/max_cap*100, digits=2)`% more bikes** when adding the bike equally to all stations.
+
+About the confidence of the forecasting, it's high: R\^2 of 99.72% and significant p-values. However, it is far from the truth for the year before 2021.
+
+```{r}
+# Extract summary for the linear regression based on maximum capacity
+summary(sc2_lms$model[[1]])
+```
+
+## 4. Conclusions
+
+### 4.1 Assumptions and Limitations
+
+1.  The historical data is limited to only 5 years and of those, only 3 are used to do the forecasting with the assumption that the peak network utilization demand follows a linear relationship with the year.
+
+2.  The distribution of the stations is not considered.
+
+3.  The act of network balancing (i.e. moving bikes from one station to another by trucks) is not considered and can artificially inflate the demand.
+
+### 4.2 Key takeaways
+
+1.  In recent years, the demand for BIXI has still steadily increased, with both the number of rides and the peak maximum number of bikes on roads increasing through the years.
+
+2.  The pandemic has heavily affected the bike-sharing service but it takes only a year to bounce back.
+
+3.  For the year 2024, if all newly added bikes are put to use in peak hours, BIXI will need to add 54 and 696 more bikes in the conservative and aggressive scenario respectively. When the new bikes are added equally to all stations (without any efficiency), they will need 2.1% or 27.25% more bikes. The real numbers must lie between those values. The forecast is summarized in the following table:
+
+| Scenario \\ Distributions               | 100% efficiency   | Equally distributed to all stations |
+|:----------------------------|:-------------------|:----------------------|
+| Conservative, based on 2019, 2022, 2023 | \+ 54 more bikes  | \+ 2.11% more bikes                 |
+| Aggressive, based on 2021-2023          | \+ 696 more bikes | \+ 27.25% more bikes                |
+
+<br> <br> <br>
