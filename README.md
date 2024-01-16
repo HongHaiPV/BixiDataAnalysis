@@ -1,7 +1,7 @@
 ![R](https://img.shields.io/badge/r-%23276DC3.svg?style=for-the-badge&logo=r&logoColor=white)
 ![GitHub last commit](https://img.shields.io/github/last-commit/honghaipv/BixiDataAnalysis)
 [![MIT License](https://img.shields.io/badge/License-MIT-green.svg)](https://choosealicense.com/licenses/mit/)
-# BIXI Data Analysis (EDA) in R
+# BIXI Data Analyses in R
 
 A series of data analyses for BIXI open data in R, including EDA, predictive analysis, and more.
 
@@ -28,7 +28,7 @@ This repository contains a series of data analysis works written in R markdown. 
 1. **01-pre-process.Rmd**: Extract, clean, and pre-process the original data into CSV files.
 2. **02-demand-forecast.Rmd**: Explore data using plots, analyze the network utilization and forecast future demand using linear regression models.
 
-The HTML outputs are knitted using R Studio and can be located in the html folder.
+The HTML outputs are knitted using R Studio and can be located in the [html](html/) folder.
 ## Authors
 
 [@honghaipv](https://www.github.com/honghaipv)
